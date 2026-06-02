@@ -1,0 +1,22 @@
+[project]
+name = "speos-rawxm3-sample-script"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "h5py>=3.16.0",
+    "pyside6>=6.11.0",
+    "pyvista>=0.47.3",
+    "pyvistaqt>=0.11.4",
+    "tqdm>=4.67.3",
+]
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.20.0",
+]
