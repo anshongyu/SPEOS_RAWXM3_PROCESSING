@@ -6,6 +6,9 @@ __pycache__/
 build/
 dist/
 *.spec.bak
+*.exe
+*.7z
+*.zip
 
 # PyInstaller cache
 *.manifest
