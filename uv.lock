@@ -1248,6 +1248,8 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "h5py" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pyside6" },
     { name = "pyvista" },
     { name = "pyvistaqt" },
@@ -1262,6 +1264,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "h5py", specifier = ">=3.16.0" },
+    { name = "numpy", specifier = ">=2.2.6" },
     { name = "pyside6", specifier = ">=6.11.0" },
     { name = "pyvista", specifier = ">=0.47.3" },
     { name = "pyvistaqt", specifier = ">=0.11.4" },

@@ -23,12 +23,12 @@
 
 中文：
 - 批量读取目录中的 RAWXM3 文件。
-- 按阈值过滤后，导出指定分类下各层最大值与坐标到 CSV。
+- 按阈值过滤后，按角度网格导出每个文件的 layer 最大值到 CSV。
 - 支持命令行与桌面 UI 两种模式。
 
 English:
 - Batch-load RAWXM3 files from a directory.
-- Apply threshold filtering and export per-layer maxima + coordinates to CSV.
+- Apply threshold filtering and export per-file angle-grid layer maxima to CSV.
 - Supports both CLI and desktop UI modes.
 """
 
@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -58,7 +59,6 @@ from PySide6.QtWidgets import (
 	QMessageBox,
 	QPlainTextEdit,
 	QPushButton,
-	QSpinBox,
 	QVBoxLayout,
 	QWidget,
 )
@@ -75,6 +75,10 @@ CATEGORY_PREFIXES = {
 	"Incident": "Incident Layer",
 	"Reflection": "Reflection Layer",
 }
+SOURCE_PATTERN = re.compile(
+	r"^\s*Z(?P<zenith>[+-]?\d+(?:\.\d+)?)_A(?P<azimuth>[+-]?\d+(?:\.\d+)?)\s*$",
+	re.IGNORECASE,
+)
 
 
 def normalize_text(value: Any) -> str:
@@ -214,28 +218,46 @@ def convert_rawxm3_to_aggregated_mesh(rawxm3_path: Path) -> AggregatedMeshData:
 
 def build_filter_mask(
 	facets_data: dict[str, np.ndarray],
-	surface_threshold_mm2: float,
-	ray_hits_threshold: int,
+	surface_percentile: float,
+	ray_hits_percentile: float,
 	cell_count: int,
 ) -> np.ndarray:
-	"""构建过滤掩码 / Build keep-mask from Surface and Ray hits thresholds.
+	"""构建过滤掩码 / Build keep-mask from Surface and Ray hits percentiles.
 
 	当前规则：仅当两个条件都不满足时过滤。
 	Current rule: filter out a cell only when both conditions fail.
 	"""
 	# Keep behavior aligned with the latest UI script:
 	# filter out a cell only when both active filter conditions fail.
+	def _compute_percentile_threshold(name: str, percentile: float) -> float | None:
+		values = facets_data.get(name)
+		if values is None:
+			return None
+
+		finite_values = values[np.isfinite(values)]
+		if finite_values.size == 0:
+			return None
+
+		if name == RAY_HITS_FIELD:
+			# Exclude 0 hits to avoid dragging the threshold down to 0.
+			finite_values = finite_values[finite_values != 0.0]
+			if finite_values.size == 0:
+				return 0.0
+
+		return float(np.percentile(finite_values, percentile))
+
 	surface_fail: np.ndarray | None = None
 	ray_hits_fail: np.ndarray | None = None
 
 	surface_values = facets_data.get(SURFACE_FIELD)
-	surface_threshold_m2 = float(surface_threshold_mm2) / 1_000_000.0
-	if surface_values is not None and surface_threshold_m2 > 0:
+	surface_threshold_m2 = _compute_percentile_threshold(SURFACE_FIELD, surface_percentile)
+	if surface_values is not None and surface_threshold_m2 is not None:
 		surface_fail = surface_values < surface_threshold_m2
 
 	ray_hits_values = facets_data.get(RAY_HITS_FIELD)
-	if ray_hits_values is not None and ray_hits_threshold > 0:
-		ray_hits_fail = ray_hits_values < float(ray_hits_threshold)
+	ray_hits_threshold = _compute_percentile_threshold(RAY_HITS_FIELD, ray_hits_percentile)
+	if ray_hits_values is not None and ray_hits_threshold is not None:
+		ray_hits_fail = ray_hits_values < ray_hits_threshold
 
 	if surface_fail is not None and ray_hits_fail is not None:
 		return ~(surface_fail & ray_hits_fail)
@@ -249,12 +271,74 @@ def build_filter_mask(
 	return np.ones(cell_count, dtype=bool)
 
 
-def compute_cell_centers(vertices: np.ndarray, facets: np.ndarray) -> np.ndarray:
-	"""计算三角面中心点 / Compute triangle cell centers."""
-	p1 = vertices[facets[:, 0]]
-	p2 = vertices[facets[:, 1]]
-	p3 = vertices[facets[:, 2]]
-	return (p1 + p2 + p3) / 3.0
+def angle_key(value: float) -> float:
+	"""标准化角度键值 / Normalize float angle for stable dictionary keys."""
+	return round(float(value), 8)
+
+
+def parse_source_line(line: str, line_number: int) -> tuple[float, float]:
+	"""解析 sourcename 行文本 / Parse one sourcename entry line."""
+	match = SOURCE_PATTERN.match(line)
+	if match is None:
+		raise ValueError(
+			f"Invalid sourcename format at line {line_number}: '{line}'. Expected like Z5_A0."
+		)
+	zenith = float(match.group("zenith"))
+	azimuth = float(match.group("azimuth"))
+	return zenith, azimuth
+
+
+def load_source_angles(source_name_file: Path) -> list[tuple[float, float]]:
+	"""读取 sourcename 文件 / Load ordered (zenith, azimuth) list from sourcename.txt."""
+	if not source_name_file.exists() or not source_name_file.is_file():
+		raise ValueError(f"sourcename file does not exist: {source_name_file}")
+
+	entries: list[tuple[float, float]] = []
+	with open(source_name_file, "r", encoding="utf-8") as source_file:
+		for line_number, raw_line in enumerate(source_file, start=1):
+			line = raw_line.strip()
+			if not line:
+				continue
+			entries.append(parse_source_line(line, line_number))
+
+	if not entries:
+		raise ValueError("sourcename file is empty.")
+
+	return entries
+
+
+def build_angle_range(start: float, end: float, step: float, label: str) -> list[float]:
+	"""构建角度序列 / Build inclusive angle sequence from start/end/step."""
+	if step == 0:
+		raise ValueError(f"{label} step cannot be 0.")
+	if end > start and step < 0:
+		raise ValueError(f"{label} step must be positive when end > start.")
+	if end < start and step > 0:
+		raise ValueError(f"{label} step must be negative when end < start.")
+
+	values: list[float] = []
+	current = float(start)
+	if step > 0:
+		while current <= end + 1e-10:
+			values.append(angle_key(current))
+			current += step
+	else:
+		while current >= end - 1e-10:
+			values.append(angle_key(current))
+			current += step
+
+	if not values:
+		raise ValueError(f"{label} range is empty.")
+
+	return values
+
+
+def get_layer_index(name: str) -> int | None:
+	"""从 layer 名称提取序号 / Extract layer index from scalar field name."""
+	match = re.search(r"layer\s*(\d+)", name, flags=re.IGNORECASE)
+	if match is None:
+		return None
+	return int(match.group(1))
 
 
 def resolve_category(category: str) -> tuple[str, str]:
@@ -266,36 +350,51 @@ def resolve_category(category: str) -> tuple[str, str]:
 	return category, category
 
 
-def sanitize_filename_part(name: str) -> str:
-	"""清洗文件名片段 / Sanitize filename segment for Windows-safe output."""
-	invalid_chars = '<>:"/\\|?*'
-	sanitized = "".join("_" if ch in invalid_chars else ch for ch in name.strip())
-	sanitized = sanitized.replace(" ", "_")
-	while "__" in sanitized:
-		sanitized = sanitized.replace("__", "_")
-	return sanitized.strip("._") or "category"
+def compute_layer_filtered_maxima(
+	facets_data_np: dict[str, np.ndarray],
+	mask: np.ndarray,
+	category_prefix: str,
+) -> tuple[dict[int, float], int]:
+	"""计算每个 layer 序号的过滤后最大值 / Compute filtered max by layer index."""
+	result: dict[int, float] = {}
+	matched_layer_count = 0
+	for layer_name, layer_values in facets_data_np.items():
+		if layer_name in {SURFACE_FIELD, RAY_HITS_FIELD}:
+			continue
+		if category_prefix.lower() not in layer_name.lower():
+			continue
+		matched_layer_count += 1
+		layer_index = get_layer_index(layer_name)
+		if layer_index is None:
+			continue
+
+		filtered_values = np.where(mask, layer_values, 0.0)
+		finite_values = filtered_values[np.isfinite(filtered_values)]
+		if finite_values.size == 0:
+			result[layer_index] = 0.0
+		else:
+			result[layer_index] = float(np.max(finite_values))
+
+	return result, matched_layer_count
 
 
-def export_file_category_maxima(
+def export_file_angle_grid(
 	rawxm3_path: Path,
 	output_dir: Path,
 	category_input: str,
-	surface_threshold_mm2: float,
-	ray_hits_threshold: int,
+	surface_percentile: float,
+	ray_hits_percentile: float,
+	source_angles: list[tuple[float, float]],
+	zenith_values: list[float],
+	azimuth_values: list[float],
 ) -> Path:
-	"""导出单文件分类层结果 / Export one RAWXM3 file results to CSV.
-
-	CSV 列：category, layer_name, filtered_max, x, y, z
-	CSV fields: category, layer_name, filtered_max, x, y, z
-	"""
+	"""导出单文件角度网格结果 / Export one RAWXM3 file angle-grid CSV."""
 	aggregated = convert_rawxm3_to_aggregated_mesh(rawxm3_path)
 
 	if not aggregated.vertices or not aggregated.facets:
 		raise ValueError("No geometry found in file.")
 
-	vertices = np.asarray(aggregated.vertices, dtype=np.float64)
 	facets = np.asarray(aggregated.facets, dtype=np.int64)
-	centers = compute_cell_centers(vertices, facets)
 
 	facets_data_np = {
 		name: np.asarray(values, dtype=np.float64)
@@ -309,74 +408,66 @@ def export_file_category_maxima(
 				f"Cell data size mismatch for '{name}': expected {cell_count}, got {values.size}."
 			)
 
-	category_name, category_prefix = resolve_category(category_input)
-	layer_names = [
-		name for name in facets_data_np.keys() if category_prefix.lower() in name.lower()
-	]
-
 	mask = build_filter_mask(
 		facets_data=facets_data_np,
-		surface_threshold_mm2=surface_threshold_mm2,
-		ray_hits_threshold=ray_hits_threshold,
+		surface_percentile=surface_percentile,
+		ray_hits_percentile=ray_hits_percentile,
 		cell_count=cell_count,
 	)
 
-	rows: list[dict[str, str]] = []
-	for layer_name in sorted(layer_names):
-		layer_values = facets_data_np[layer_name]
-		filtered_values = np.where(mask, layer_values, 0.0)
-		finite_mask = np.isfinite(filtered_values)
-
-		if filtered_values.size == 0 or not np.any(finite_mask):
-			rows.append(
-				{
-					"category": category_name,
-					"layer_name": layer_name,
-					"filtered_max": "",
-					"x": "",
-					"y": "",
-					"z": "",
-				}
-			)
-			continue
-
-		valid_indices = np.where(finite_mask)[0]
-		valid_values = filtered_values[finite_mask]
-		max_local_index = int(np.argmax(valid_values))
-		max_cell_id = int(valid_indices[max_local_index])
-		max_value = float(valid_values[max_local_index])
-
-		if 0 <= max_cell_id < len(centers):
-			max_position = centers[max_cell_id]
-			x_value = f"{float(max_position[0]):.9g}"
-			y_value = f"{float(max_position[1]):.9g}"
-			z_value = f"{float(max_position[2]):.9g}"
-		else:
-			x_value = ""
-			y_value = ""
-			z_value = ""
-
-		rows.append(
-			{
-				"category": category_name,
-				"layer_name": layer_name,
-				"filtered_max": f"{max_value:.9g}",
-				"x": x_value,
-				"y": y_value,
-				"z": z_value,
-			}
+	category_name, category_prefix = resolve_category(category_input)
+	layer_maxima, matched_layer_count = compute_layer_filtered_maxima(
+		facets_data_np,
+		mask,
+		category_prefix=category_prefix,
+	)
+	if matched_layer_count == 0:
+		raise ValueError(
+			f"No layers found for category '{category_name}' in file '{rawxm3_path.name}'."
 		)
+
+	angle_to_layer: dict[tuple[float, float], int] = {}
+	for layer_index, (zenith, azimuth) in enumerate(source_angles):
+		key = (angle_key(zenith), angle_key(azimuth))
+		if key in angle_to_layer:
+			raise ValueError(
+				f"Duplicate angle mapping in sourcename: Z{zenith}_A{azimuth}."
+			)
+		angle_to_layer[key] = layer_index
+
+	rows: list[list[str]] = []
+	header = ["zenith\\azimuth"] + [f"{azimuth:g}" for azimuth in azimuth_values]
+	rows.append(header)
+
+	for zenith in zenith_values:
+		row = [f"{zenith:g}"]
+		for azimuth in azimuth_values:
+			lookup_azimuth = azimuth
+			if abs(zenith - 90.0) <= 1e-8:
+				# Special case: use (Z=90, A=0) value for all azimuth columns.
+				lookup_azimuth = 0.0
+
+			key = (zenith, angle_key(lookup_azimuth))
+			if key not in angle_to_layer:
+				raise ValueError(
+					f"No corresponding angle mapping for Z{zenith:g}_A{lookup_azimuth:g} in sourcename file."
+				)
+
+			layer_index = angle_to_layer[key]
+			if layer_index not in layer_maxima:
+				raise ValueError(
+					f"No corresponding {category_name} layer{layer_index} data for "
+					f"Z{zenith:g}_A{lookup_azimuth:g}."
+				)
+
+			row.append(f"{layer_maxima[layer_index]:.9g}")
+		rows.append(row)
 
 	output_dir.mkdir(parents=True, exist_ok=True)
-	category_part = sanitize_filename_part(category_name)
-	output_csv = output_dir / f"{rawxm3_path.stem}_{category_part}.csv"
+	output_csv = output_dir / f"{rawxm3_path.stem}.csv"
 
 	with open(output_csv, "w", encoding="utf-8-sig", newline="") as csv_file:
-		writer = csv.DictWriter(
-			csv_file,
-			fieldnames=["category", "layer_name", "filtered_max", "x", "y", "z"],
-		)
-		writer.writeheader()
+		writer = csv.writer(csv_file)
 		writer.writerows(rows)
 
 	return output_csv
@@ -403,31 +494,39 @@ def parse_args() -> argparse.Namespace:
 	"""解析 CLI 参数 / Parse command-line arguments."""
 	parser = argparse.ArgumentParser(
 		description=(
-			"Batch process RAWXM3 files in a directory and export per-file CSV containing "
-			"filtered maxima (value and coordinate) for all layers in a selected category."
+			"Batch process RAWXM3 files and export one angle-grid CSV per file. "
+			"Layer-index-to-angle mapping is loaded from sourcename.txt."
 		)
 	)
 	parser.add_argument("input_dir", nargs="?", type=Path, help="Directory containing RAWXM3 files")
+	parser.add_argument("--sourcename-file", type=Path, required=False, help="Path to sourcename.txt")
 	parser.add_argument(
 		"--category",
 		required=False,
+		default="Transmission",
 		help=(
-			"Category name (Transmission/Absorption/Incident/Reflection) or a custom "
-			"layer-name prefix"
+			"Layer category name (Transmission/Absorption/Incident/Reflection) "
+			"or a custom layer-name prefix"
 		),
 	)
 	parser.add_argument(
-		"--surface-threshold-mm2",
+		"--surface-percentile",
 		type=float,
 		default=0.0,
-		help="Surface threshold in mm^2 (converted to m^2 during filtering)",
+		help="Surface percentile (0-100)",
 	)
 	parser.add_argument(
-		"--rayhits-threshold",
-		type=int,
+		"--rayhits-percentile",
+		type=float,
 		default=0,
-		help="Ray hits threshold",
+		help="Ray hits percentile (0-100), with 0-values excluded in threshold computation",
 	)
+	parser.add_argument("--zenith-start", type=float, default=0.0, help="Zenith start angle")
+	parser.add_argument("--zenith-end", type=float, default=0.0, help="Zenith end angle")
+	parser.add_argument("--zenith-step", type=float, default=1.0, help="Zenith angle step")
+	parser.add_argument("--azimuth-start", type=float, default=0.0, help="Azimuth start angle")
+	parser.add_argument("--azimuth-end", type=float, default=0.0, help="Azimuth end angle")
+	parser.add_argument("--azimuth-step", type=float, default=1.0, help="Azimuth angle step")
 	parser.add_argument(
 		"--output-dir",
 		type=Path,
@@ -450,9 +549,16 @@ def parse_args() -> argparse.Namespace:
 def run_batch_processing(
 	input_dir: Path,
 	output_dir: Path,
+	source_name_file: Path,
 	category: str,
-	surface_threshold_mm2: float,
-	rayhits_threshold: int,
+	surface_percentile: float,
+	rayhits_percentile: float,
+	zenith_start: float,
+	zenith_end: float,
+	zenith_step: float,
+	azimuth_start: float,
+	azimuth_end: float,
+	azimuth_step: float,
 	recursive: bool,
 	logger: Callable[[str], None],
 ) -> int:
@@ -466,10 +572,25 @@ def run_batch_processing(
 		logger(f"No RAWXM3 files found in: {input_dir}")
 		return 1
 
+	try:
+		source_angles = load_source_angles(source_name_file)
+		zenith_values = build_angle_range(zenith_start, zenith_end, zenith_step, "Zenith")
+		azimuth_values = build_angle_range(azimuth_start, azimuth_end, azimuth_step, "Azimuth")
+	except Exception as exc:
+		logger(f"Configuration error: {exc}")
+		return 1
+
 	logger(f"Found {len(files)} RAWXM3 files.")
-	logger(f"Category: {category}")
-	logger(f"Surface threshold: {surface_threshold_mm2} mm^2")
-	logger(f"Ray hits threshold: {rayhits_threshold}")
+	logger(f"Source mapping file: {source_name_file}")
+	logger(f"Layer category: {category}")
+	logger(f"Surface percentile: {surface_percentile}%")
+	logger(f"Ray hits percentile: {rayhits_percentile}% (0-values excluded)")
+	logger(
+		f"Zenith range: start={zenith_start}, end={zenith_end}, step={zenith_step}"
+	)
+	logger(
+		f"Azimuth range: start={azimuth_start}, end={azimuth_end}, step={azimuth_step}"
+	)
 	logger(f"Output directory: {output_dir}")
 
 	success = 0
@@ -478,12 +599,15 @@ def run_batch_processing(
 	for file_path in files:
 		logger(f"\nProcessing: {file_path.name}")
 		try:
-			output_csv = export_file_category_maxima(
+			output_csv = export_file_angle_grid(
 				rawxm3_path=file_path,
 				output_dir=output_dir,
 				category_input=category,
-				surface_threshold_mm2=surface_threshold_mm2,
-				ray_hits_threshold=rayhits_threshold,
+				surface_percentile=surface_percentile,
+				ray_hits_percentile=rayhits_percentile,
+				source_angles=source_angles,
+				zenith_values=zenith_values,
+				azimuth_values=azimuth_values,
 			)
 			logger(f"Exported: {output_csv.name}")
 			success += 1
@@ -531,22 +655,71 @@ class BatchPostWindow(QMainWindow):
 		output_row.addWidget(output_browse)
 		form_layout.addRow("Output directory", output_row)
 
+		source_row = QHBoxLayout()
+		self.source_file_edit = QLineEdit()
+		self.source_file_edit.setPlaceholderText("Select sourcename.txt")
+		source_browse = QPushButton("Browse")
+		source_browse.clicked.connect(self._choose_source_file)
+		source_row.addWidget(self.source_file_edit, 1)
+		source_row.addWidget(source_browse)
+		form_layout.addRow("Sourcename file", source_row)
+
 		self.category_combo = QComboBox()
 		self.category_combo.setEditable(True)
 		self.category_combo.addItems(list(CATEGORY_PREFIXES.keys()))
-		form_layout.addRow("Category", self.category_combo)
+		form_layout.addRow("Layer category", self.category_combo)
 
 		self.surface_spin = QDoubleSpinBox()
-		self.surface_spin.setRange(0.0, 1e12)
-		self.surface_spin.setDecimals(6)
-		self.surface_spin.setSingleStep(0.1)
+		self.surface_spin.setRange(0.0, 100.0)
+		self.surface_spin.setDecimals(2)
+		self.surface_spin.setSingleStep(1.0)
+		self.surface_spin.setSuffix(" %")
 		self.surface_spin.setValue(0.0)
-		form_layout.addRow("Surface threshold (mm^2)", self.surface_spin)
+		form_layout.addRow("Surface percentile", self.surface_spin)
 
-		self.rayhits_spin = QSpinBox()
-		self.rayhits_spin.setRange(0, 2147483647)
+		self.rayhits_spin = QDoubleSpinBox()
+		self.rayhits_spin.setRange(0.0, 100.0)
+		self.rayhits_spin.setDecimals(2)
+		self.rayhits_spin.setSingleStep(1.0)
+		self.rayhits_spin.setSuffix(" %")
 		self.rayhits_spin.setValue(0)
-		form_layout.addRow("Ray hits threshold", self.rayhits_spin)
+		form_layout.addRow("Ray hits percentile", self.rayhits_spin)
+
+		self.zenith_start_spin = QDoubleSpinBox()
+		self.zenith_start_spin.setRange(-360.0, 360.0)
+		self.zenith_start_spin.setDecimals(3)
+		self.zenith_start_spin.setValue(0.0)
+		form_layout.addRow("Zenith start", self.zenith_start_spin)
+
+		self.zenith_end_spin = QDoubleSpinBox()
+		self.zenith_end_spin.setRange(-360.0, 360.0)
+		self.zenith_end_spin.setDecimals(3)
+		self.zenith_end_spin.setValue(10.0)
+		form_layout.addRow("Zenith end", self.zenith_end_spin)
+
+		self.zenith_step_spin = QDoubleSpinBox()
+		self.zenith_step_spin.setRange(-360.0, 360.0)
+		self.zenith_step_spin.setDecimals(3)
+		self.zenith_step_spin.setValue(5.0)
+		form_layout.addRow("Zenith step", self.zenith_step_spin)
+
+		self.azimuth_start_spin = QDoubleSpinBox()
+		self.azimuth_start_spin.setRange(-360.0, 360.0)
+		self.azimuth_start_spin.setDecimals(3)
+		self.azimuth_start_spin.setValue(-90.0)
+		form_layout.addRow("Azimuth start", self.azimuth_start_spin)
+
+		self.azimuth_end_spin = QDoubleSpinBox()
+		self.azimuth_end_spin.setRange(-360.0, 360.0)
+		self.azimuth_end_spin.setDecimals(3)
+		self.azimuth_end_spin.setValue(90.0)
+		form_layout.addRow("Azimuth end", self.azimuth_end_spin)
+
+		self.azimuth_step_spin = QDoubleSpinBox()
+		self.azimuth_step_spin.setRange(-360.0, 360.0)
+		self.azimuth_step_spin.setDecimals(3)
+		self.azimuth_step_spin.setValue(90.0)
+		form_layout.addRow("Azimuth step", self.azimuth_step_spin)
 
 		self.recursive_check = QCheckBox("Recursive scan")
 		self.recursive_check.setChecked(False)
@@ -580,6 +753,17 @@ class BatchPostWindow(QMainWindow):
 		if directory:
 			self.output_dir_edit.setText(directory)
 
+	def _choose_source_file(self) -> None:
+		"""选择 sourcename 文件 / Select sourcename.txt file."""
+		file_path, _ = QFileDialog.getOpenFileName(
+			self,
+			"Select sourcename file",
+			"",
+			"Text files (*.txt);;All files (*.*)",
+		)
+		if file_path:
+			self.source_file_edit.setText(file_path)
+
 	def _append_log(self, message: str) -> None:
 		"""追加日志文本 / Append one line to UI log area."""
 		self.log_output.appendPlainText(message)
@@ -592,9 +776,14 @@ class BatchPostWindow(QMainWindow):
 			QMessageBox.warning(self, "Run Batch", "Please select an input directory.")
 			return
 
+		source_file_raw = self.source_file_edit.text().strip()
+		if not source_file_raw:
+			QMessageBox.warning(self, "Run Batch", "Please select sourcename.txt.")
+			return
+
 		category = self.category_combo.currentText().strip()
 		if not category:
-			QMessageBox.warning(self, "Run Batch", "Please input a category.")
+			QMessageBox.warning(self, "Run Batch", "Please select or input a layer category.")
 			return
 
 		input_dir = Path(input_dir_raw).resolve()
@@ -607,9 +796,16 @@ class BatchPostWindow(QMainWindow):
 			code = run_batch_processing(
 				input_dir=input_dir,
 				output_dir=output_dir,
+				source_name_file=Path(source_file_raw).resolve(),
 				category=category,
-				surface_threshold_mm2=float(self.surface_spin.value()),
-				rayhits_threshold=int(self.rayhits_spin.value()),
+				surface_percentile=float(self.surface_spin.value()),
+				rayhits_percentile=float(self.rayhits_spin.value()),
+				zenith_start=float(self.zenith_start_spin.value()),
+				zenith_end=float(self.zenith_end_spin.value()),
+				zenith_step=float(self.zenith_step_spin.value()),
+				azimuth_start=float(self.azimuth_start_spin.value()),
+				azimuth_end=float(self.azimuth_end_spin.value()),
+				azimuth_step=float(self.azimuth_step_spin.value()),
 				recursive=bool(self.recursive_check.isChecked()),
 				logger=self._append_log,
 			)
@@ -637,8 +833,8 @@ def main() -> int:
 	if bool(args.gui) or args.input_dir is None:
 		return launch_gui()
 
-	if not args.category:
-		print("--category is required in CLI mode.")
+	if args.sourcename_file is None:
+		print("--sourcename-file is required in CLI mode.")
 		return 1
 
 	input_dir = args.input_dir.resolve()
@@ -646,9 +842,16 @@ def main() -> int:
 	return run_batch_processing(
 		input_dir=input_dir,
 		output_dir=output_dir,
+		source_name_file=args.sourcename_file.resolve(),
 		category=str(args.category),
-		surface_threshold_mm2=float(args.surface_threshold_mm2),
-		rayhits_threshold=int(args.rayhits_threshold),
+		surface_percentile=float(args.surface_percentile),
+		rayhits_percentile=float(args.rayhits_percentile),
+		zenith_start=float(args.zenith_start),
+		zenith_end=float(args.zenith_end),
+		zenith_step=float(args.zenith_step),
+		azimuth_start=float(args.azimuth_start),
+		azimuth_end=float(args.azimuth_end),
+		azimuth_step=float(args.azimuth_step),
 		recursive=bool(args.recursive),
 		logger=print,
 	)

@@ -63,7 +63,8 @@ from tqdm import tqdm  # type: ignore[import-untyped]
 
 # 过滤字段常量 / Filter field constants
 SURFACE_FIELD = "Triangle Surface (m^2)"
-SURFACE_THRESHOLD_LABEL = "Triangle Surface threshold (mm^2)"
+SURFACE_PERCENT_LABEL = "Triangle Surface percentile (%)"
+RAY_HITS_PERCENT_LABEL = "Ray hits percentile (%)"
 RAY_HITS_FIELD = "Ray hits"
 FILTER_FIELDS = {SURFACE_FIELD, RAY_HITS_FIELD}
 DISPLAY_FIELD = "__display_values__"
@@ -582,24 +583,35 @@ class VtpViewerWindow(QMainWindow):
         self.colorbar_max_spin.setEnabled(False)
         form_layout.addRow("Colorbar max", self.colorbar_max_spin)
 
-        self.surface_threshold = ScientificDoubleSpinBox()
-        self.surface_threshold.setDecimals(6)
-        self.surface_threshold.setRange(0.0, 1e12)
-        self.surface_threshold.setSingleStep(0.001)
-        self.surface_threshold.valueChanged.connect(self.update_visualization)
-        self.surface_threshold.setEnabled(False)
-        form_layout.addRow(SURFACE_THRESHOLD_LABEL, self.surface_threshold)
+        self.surface_percent = QDoubleSpinBox()
+        self.surface_percent.setDecimals(2)
+        self.surface_percent.setRange(0.0, 100.0)
+        self.surface_percent.setSingleStep(1.0)
+        self.surface_percent.setSuffix(" %")
+        self.surface_percent.valueChanged.connect(self.update_visualization)
+        self.surface_percent.setEnabled(False)
+        form_layout.addRow(SURFACE_PERCENT_LABEL, self.surface_percent)
 
-        self.ray_hits_threshold = QSpinBox()
-        self.ray_hits_threshold.setRange(0, 2147483647)
-        self.ray_hits_threshold.setSingleStep(1)
-        self.ray_hits_threshold.valueChanged.connect(self.update_visualization)
-        self.ray_hits_threshold.setEnabled(False)
-        form_layout.addRow(RAY_HITS_FIELD, self.ray_hits_threshold)
+        self.ray_hits_percent = QDoubleSpinBox()
+        self.ray_hits_percent.setDecimals(2)
+        self.ray_hits_percent.setRange(0.0, 100.0)
+        self.ray_hits_percent.setSingleStep(1.0)
+        self.ray_hits_percent.setSuffix(" %")
+        self.ray_hits_percent.valueChanged.connect(self.update_visualization)
+        self.ray_hits_percent.setEnabled(False)
+        form_layout.addRow(RAY_HITS_PERCENT_LABEL, self.ray_hits_percent)
+
+        self.surface_threshold_value_label = QLabel("-")
+        self.surface_threshold_value_label.setTextInteractionFlags(TEXT_SELECTABLE)
+        form_layout.addRow("Triangle Surface threshold (mm^2)", self.surface_threshold_value_label)
+
+        self.ray_hits_threshold_value_label = QLabel("-")
+        self.ray_hits_threshold_value_label.setTextInteractionFlags(TEXT_SELECTABLE)
+        form_layout.addRow("Ray hits threshold", self.ray_hits_threshold_value_label)
 
         control_layout.addLayout(form_layout)
 
-        self.reset_button = QPushButton("Reset thresholds")
+        self.reset_button = QPushButton("Reset filter percentiles")
         self.reset_button.clicked.connect(self.reset_thresholds)
         self.reset_button.setEnabled(False)
         control_layout.addWidget(self.reset_button)
@@ -954,17 +966,18 @@ class VtpViewerWindow(QMainWindow):
         surface_values = self._get_numeric_cell_data(SURFACE_FIELD)
         ray_hits_values = self._get_numeric_cell_data(RAY_HITS_FIELD)
 
-        self.surface_threshold.blockSignals(True)
-        self.ray_hits_threshold.blockSignals(True)
+        self.surface_percent.blockSignals(True)
+        self.surface_percent.setValue(0.0)
+        self.surface_percent.setEnabled(surface_values is not None)
+        self.surface_percent.blockSignals(False)
 
-        self.surface_threshold.setValue(0.0)
-        self.ray_hits_threshold.setValue(0)
+        self.ray_hits_percent.blockSignals(True)
+        self.ray_hits_percent.setValue(0.0)
+        self.ray_hits_percent.setEnabled(ray_hits_values is not None)
+        self.ray_hits_percent.blockSignals(False)
 
-        self.surface_threshold.setEnabled(surface_values is not None)
-        self.ray_hits_threshold.setEnabled(ray_hits_values is not None)
-
-        self.surface_threshold.blockSignals(False)
-        self.ray_hits_threshold.blockSignals(False)
+        self.surface_threshold_value_label.setText("-")
+        self.ray_hits_threshold_value_label.setText("-")
 
         missing_filters = [
             name
@@ -983,7 +996,7 @@ class VtpViewerWindow(QMainWindow):
             )
         elif self.generated_vtp_path is None:
             self.info_label.setText(
-                "For non-filter layers, cells are set to 0 only when both Surface and Ray hits are below thresholds."
+                "Set Surface and Ray hits percentiles separately. Thresholds are computed from distributions; for non-filter layers, cells are set to 0 only when both values are below computed thresholds."
             )
 
     def _get_numeric_cell_data(self, name: str) -> np.ndarray | None:
@@ -1000,15 +1013,50 @@ class VtpViewerWindow(QMainWindow):
             return None
         return values.astype(np.float64, copy=False)
 
-    def _get_surface_threshold_m2(self) -> float:
-        """用途 Purpose:
-        - 将界面输入的 mm² 阈值换算为 m²。
-        - Convert the UI surface threshold from mm² to m².
+    def _compute_percentile_threshold(self, name: str, percentile: float) -> float | None:
+        """按百分位计算阈值 / Compute threshold value from percentile.
 
-        返回 Returns:
-        - float: 以 m² 为单位的过滤阈值。
+        中文：对指定数组取有限值并计算百分位阈值。
+        English: Uses finite values of a target array to compute percentile threshold.
         """
-        return self.surface_threshold.value() / 1_000_000.0
+        values = self._get_numeric_cell_data(name)
+        if values is None:
+            return None
+
+        finite_values = values[np.isfinite(values)]
+        if finite_values.size == 0:
+            return None
+
+        if name == RAY_HITS_FIELD:
+            # Ray hits 阈值统计中排除 0，避免大量未命中单元把阈值拉低到 0。
+            finite_values = finite_values[finite_values != 0.0]
+            if finite_values.size == 0:
+                return 0.0
+
+        return float(np.percentile(finite_values, percentile))
+
+    def _update_threshold_value_labels(
+        self,
+        surface_percentile: float,
+        ray_hits_percentile: float,
+        surface_threshold_m2: float | None,
+        ray_hits_threshold: float | None,
+    ) -> None:
+        """刷新界面中的计算阈值文本 / Refresh computed threshold display labels."""
+        if surface_threshold_m2 is None:
+            self.surface_threshold_value_label.setText("N/A")
+        else:
+            surface_threshold_mm2 = surface_threshold_m2 * 1_000_000.0
+            self.surface_threshold_value_label.setText(
+                f"{surface_threshold_mm2:.6g} (P{surface_percentile:.2f})"
+            )
+
+        if ray_hits_threshold is None:
+            self.ray_hits_threshold_value_label.setText("N/A")
+        else:
+            self.ray_hits_threshold_value_label.setText(
+                f"{ray_hits_threshold:.6g} (P{ray_hits_percentile:.2f})"
+            )
 
     def build_filter_mask(self) -> np.ndarray:
         """用途 Purpose:
@@ -1020,17 +1068,34 @@ class VtpViewerWindow(QMainWindow):
         """
         assert self.mesh is not None
 
+        surface_percentile = float(self.surface_percent.value())
+        ray_hits_percentile = float(self.ray_hits_percent.value())
+
         surface_fail: np.ndarray | None = None
         ray_hits_fail: np.ndarray | None = None
 
         surface_values = self._get_numeric_cell_data(SURFACE_FIELD)
-        surface_threshold_m2 = self._get_surface_threshold_m2()
-        if surface_values is not None and surface_threshold_m2 > 0:
+        surface_threshold_m2 = self._compute_percentile_threshold(
+            SURFACE_FIELD,
+            surface_percentile,
+        )
+        if surface_values is not None and surface_threshold_m2 is not None:
             surface_fail = surface_values < surface_threshold_m2
 
         ray_hits_values = self._get_numeric_cell_data(RAY_HITS_FIELD)
-        if ray_hits_values is not None and self.ray_hits_threshold.value() > 0:
-            ray_hits_fail = ray_hits_values < self.ray_hits_threshold.value()
+        ray_hits_threshold = self._compute_percentile_threshold(
+            RAY_HITS_FIELD,
+            ray_hits_percentile,
+        )
+        if ray_hits_values is not None and ray_hits_threshold is not None:
+            ray_hits_fail = ray_hits_values < ray_hits_threshold
+
+        self._update_threshold_value_labels(
+            surface_percentile,
+            ray_hits_percentile,
+            surface_threshold_m2,
+            ray_hits_threshold,
+        )
 
         if surface_fail is not None and ray_hits_fail is not None:
             filtered_mask = surface_fail & ray_hits_fail
@@ -1163,19 +1228,21 @@ class VtpViewerWindow(QMainWindow):
                 f"Cells passing threshold: {visible_count}/{total_count}\n"
                 f"Displayed min/max: {float(np.min(values)):.6g} / {float(np.max(values)):.6g}\n"
                 f"Colorbar min/max: {self.colorbar_min_spin.value():.6g} / {self.colorbar_max_spin.value():.6g}\n"
-                f"Surface threshold (mm^2): {self.surface_threshold.value():.6g}\n"
-                f"Ray hits threshold: {self.ray_hits_threshold.value():.6g}"
+                f"Surface percentile: {self.surface_percent.value():.2f}%\n"
+                f"Ray hits percentile: {self.ray_hits_percent.value():.2f}%\n"
+                f"Surface threshold (mm^2): {self.surface_threshold_value_label.text()}\n"
+                f"Ray hits threshold: {self.ray_hits_threshold_value_label.text()}"
             )
 
         self.stats_label.setText(stats_text)
 
     def reset_thresholds(self) -> None:
         """用途 Purpose:
-        - 将 Surface 与 Ray hits 阈值恢复为 0。
-        - Reset Surface and Ray hits thresholds to 0.
+        - 将面积与 Ray hits 过滤百分比分别恢复为 0。
+        - Reset Surface and Ray hits filter percentiles to 0.
         """
-        self.surface_threshold.setValue(0.0)
-        self.ray_hits_threshold.setValue(0)
+        self.surface_percent.setValue(0.0)
+        self.ray_hits_percent.setValue(0.0)
 
     def toggle_measurement(self, enabled: bool) -> None:
         """用途 Purpose:

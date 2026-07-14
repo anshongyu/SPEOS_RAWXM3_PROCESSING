@@ -1,0 +1,12 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Build and packaging outputs
+build/
+dist/
+*.spec.bak
+
+# PyInstaller cache
+*.manifest
+*.pkg
